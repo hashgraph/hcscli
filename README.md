@@ -6,6 +6,32 @@ To get started, you must either have a **`mainnet`** or a **`testnet`** account.
 register at [portal.hedera.com](https://portal.hedera.com) to get an *account*. You must update
 [hedera_env.json](hedera_env.json) with your account info before running the tool.
 
+## Installation
+
+``` shell
+$ git clone https://github.com/hashgraph/hcscli
+```
+
+## Configure your Hedera environment 
+
+* Open the hedera_env.json file
+* Enter your Hedera account (x.z.y format) 
+* Enter your private key
+* Save the file
+
+## Get your account balance
+
+``` shell
+$ cd hcscli
+$ go build
+$ ./hcscli account balance 0.0.100
+```
+Example output:
+
+``` shell
+balance for account 0.0.100 = 10000 ℏ
+```
+
 ## License Information
 
 Licensed under Apache License,
