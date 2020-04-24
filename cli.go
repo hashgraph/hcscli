@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/hashgraph/hedera-sdk-go"
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
 
 var (
+	logger *log.Logger
+
 	configFile = kingpin.Flag("config", "json configuration file").Default("./hedera_env.json").String()
 
 	// account commands
@@ -22,18 +26,25 @@ var (
 	getBalanceAccount = getBalance.Arg("accountId", "account to query balance for, default to current account").String()
 
 	// topic commands
-	topic                  = kingpin.Command("topic", "topic operations")
-	createTopic            = topic.Command("create", "create a new HCS topic")
-	createTopicCount       = createTopic.Arg("count", "the number of topics to create").Default("1").Int()
-	deleteTopic            = topic.Command("delete", "delete the specified HCS topic")
-	deleteTopicIds         = deleteTopic.Arg("id", "the topic id").Required().Strings()
-	queryTopic             = topic.Command("query", "query info of an HCS topic")
-	queryTopicId           = queryTopic.Arg("id", "the topic id").Required().String()
-	subscribeTopic         = topic.Command("subscribe", "subscribe to a topic and show messages")
-	subscribeTopicId       = subscribeTopic.Arg("id", "the topic id").Required().String()
-	subscriptTopicMsgCount = subscribeTopic.Arg("count", "number of messages to show").Default("20").Int()
-	benchmarkTopic         = topic.Command("benchmark", "benchmark a topic")
-	benchmarkTopicId       = benchmarkTopic.Arg("id", "the topic id").Required().String()
+	topic                         = kingpin.Command("topic", "topic operations")
+	createTopic                   = topic.Command("create", "create a new HCS topic")
+	createTopicCount              = createTopic.Arg("count", "the number of topics to create").Default("1").Int()
+	createTopicMemo               = createTopic.Flag("memo", "memo for the topic").String()
+	createTopicAdminKeys          = createTopic.Flag("admin-key", "public key of admin").Strings()
+	createTopicAdminExclude       = createTopic.Flag("admin-exclude", "exclude self from admin").Bool()
+	createTopicAdminKeyThreshold  = createTopic.Flag("admin-key-threshold", "threshold of admin key").Default("1").Uint32()
+	createTopicSubmitKeys         = createTopic.Flag("submit-key", "public key allowed to submit messages").Strings()
+	createTopicSubmitExclude      = createTopic.Flag("submit-exclude", "exclude self from submitting messages").Bool()
+	createTopicSubmitKeyThreshold = createTopic.Flag("submit-key-threshold", "threshold of submit key").Default("1").Uint32()
+	deleteTopic                   = topic.Command("delete", "delete the specified HCS topic")
+	deleteTopicIds                = deleteTopic.Arg("id", "the topic id").Required().Strings()
+	queryTopic                    = topic.Command("query", "query info of an HCS topic")
+	queryTopicId                  = queryTopic.Arg("id", "the topic id").Required().String()
+	subscribeTopic                = topic.Command("subscribe", "subscribe to a topic and show messages")
+	subscribeTopicId              = subscribeTopic.Arg("id", "the topic id").Required().String()
+	subscriptTopicMsgCount        = subscribeTopic.Arg("count", "number of messages to show").Default("20").Int()
+	benchmarkTopic                = topic.Command("benchmark", "benchmark a topic")
+	benchmarkTopicId              = benchmarkTopic.Arg("id", "the topic id").Required().String()
 
 	// key commands
 	key                 = kingpin.Command("key", "key operations")
@@ -117,7 +128,7 @@ func loadConfig() error {
 	}
 	nodeAddress = config.NodeAddress
 	mirrorNodeAddress = config.MirrorNodeAddress
-	fmt.Printf("loaded configuration from %s\n", configSource)
+	logger.Printf("loaded configuration from %s", configSource)
 	return nil
 }
 
@@ -128,73 +139,118 @@ func createClient() *hedera.Client {
 	return client
 }
 
-func doAccountBalance(account string) {
+func doAccountBalance() {
 	client := createClient()
 
-	var err error
 	accountId := operatorId
+	account := *getBalanceAccount
 	if account != "" {
-		accountId, err = hedera.AccountIDFromString(account)
+		tmpId, err := hedera.AccountIDFromString(account)
 		if err != nil {
-			panic(err)
+			logger.Fatalf("invalid accountId - %v", err)
 		}
+		accountId = tmpId
 	}
-	var balance hedera.Hbar
-	balance, err = hedera.NewAccountBalanceQuery().
+	balance, err := hedera.NewAccountBalanceQuery().
 		SetAccountID(accountId).
 		Execute(client)
 	if err != nil {
-		panic(err)
+		logger.Fatalf("NewAccountBalanceQuery failed - %v", err)
 	}
-
-	fmt.Printf("balance for account %v = %v\n", accountId, balance)
+	logger.Infof("balance for account %s = %v", accountId, balance)
 }
 
 func doAccountCommand(cmd string) {
 	switch cmd {
 	case "balance":
-		doAccountBalance(*getBalanceAccount)
-	default:
-		fmt.Println("unknown command", cmd)
+		doAccountBalance()
 	}
 }
 
-func doTopicCreate(client *hedera.Client, count int) []*hedera.ConsensusTopicID {
-	if count < 0 || count > 10 {
-		fmt.Printf("You can't create %d topic(s)\n", count)
-		return nil
+func makePublicKey(threshold uint32, keys []string, operatorPublicKey hedera.Ed25519PublicKey, exclOperator bool) (hedera.PublicKey, error) {
+	if threshold < 1 {
+		return nil, fmt.Errorf("invalid threshold - %d", threshold)
+	}
+
+	keySet := make(map[string]int)
+	if keys != nil {
+		for _, key := range keys {
+			keySet[key] = 1
+		}
+	}
+	if !exclOperator {
+		keySet[operatorPublicKey.String()] = 1
+	} else {
+		delete(keySet, operatorPublicKey.String())
+	}
+	if len(keySet) == 0 {
+		return nil, nil
+	}
+	if threshold > uint32(len(keySet)) {
+		return nil, fmt.Errorf("threshold (%d) > number of keys (%d)", threshold, len(keySet))
+	}
+
+	thresholdKey := hedera.NewThresholdKey(threshold)
+	var lastKey hedera.PublicKey
+	for str, _ := range keySet {
+		publicKey, err := hedera.Ed25519PublicKeyFromString(str)
+		if err != nil {
+			return nil, err
+		}
+		thresholdKey.Add(&publicKey)
+		lastKey = &publicKey
+	}
+	if len(keySet) == 1 {
+		return lastKey, nil
+	}
+	return thresholdKey, nil
+}
+
+func doTopicCreate(client *hedera.Client) {
+	count := *createTopicCount
+	if count < 1 || count > 10 {
+		logger.Fatalf("invalid count - %d\n", count)
 	}
 
 	operatorPublicKey := operatorPrivateKey.PublicKey()
-	result := make([]*hedera.ConsensusTopicID, count)
+	adminKey, err := makePublicKey(*createTopicAdminKeyThreshold, *createTopicAdminKeys, operatorPublicKey, *createTopicAdminExclude)
+	if err != nil {
+		logger.Fatalf("failed to create AdminKey for new topic - %v", err)
+	}
+	submitKey, err := makePublicKey(*createTopicSubmitKeyThreshold, *createTopicSubmitKeys, operatorPublicKey, *createTopicSubmitExclude)
+	if err != nil {
+		logger.Fatalf("failed to create SubmitKey for new topic - %v", err)
+	}
 	for i := 0; i < count; i++ {
-		txId, err := hedera.NewConsensusTopicCreateTransaction().
-			SetAdminKey(operatorPublicKey).
-			SetTransactionMemo("hcscli tool, create topic").
-			// SetMaxTransa	ctionFee(hedera.HbarFrom(8, hedera.HbarUnits.Hbar)).
-			Execute(client)
+		tx := hedera.NewConsensusTopicCreateTransaction()
+		if *createTopicMemo != "" {
+			tx.SetTopicMemo(*createTopicMemo)
+		}
+		if adminKey != nil {
+			tx.SetAdminKey(adminKey)
+		}
+		if submitKey != nil {
+			tx.SetSubmitKey(submitKey)
+		}
+		txId, err := tx.Execute(client)
 		if err != nil {
-			fmt.Printf("failed to create a new topic, %v", err)
+			logger.Printf("failed to create a new topic, %v", err)
 			continue
 		}
-
 		receipt, err := txId.GetReceipt(client)
 		if err != nil {
-			fmt.Printf("failed to get receipt of topic create transaction, %v", err)
+			logger.Infof("failed to get receipt of topic create transaction, %v", err)
 			continue
 		}
-		topicId := receipt.GetConsensusTopicID()
-		result[i] = &topicId
+		logger.Infoln("new topic id:", receipt.GetConsensusTopicID())
 	}
-
-	return result
 }
 
-func doTopicDelete(client *hedera.Client, topics *[]string) {
-	for _, topic := range *topics {
+func doTopicDelete(client *hedera.Client) {
+	for _, topic := range *deleteTopicIds {
 		topicId, err := hedera.TopicIDFromString(topic)
 		if err != nil {
-			fmt.Printf("invalid topic id %s, err = %v\n", topic, err)
+			logger.Infof("invalid topic id %s, err = %v", topic, err)
 			continue
 		}
 
@@ -203,40 +259,37 @@ func doTopicDelete(client *hedera.Client, topics *[]string) {
 			SetTopicID(topicId).
 			Execute(client)
 		if err != nil {
-			fmt.Println("failed to delete topic", topic, err)
+			logger.Infof("failed to delete topic %s = %v", topic, err)
 			continue
 		}
 
 		_, err = txId.GetReceipt(client)
 		if err != nil {
-			fmt.Println("failed to get receipt for topic deletion,", topic, err)
+			logger.Infof("failed to get receipt for topic %s deletion = %v", topic, err)
 		} else {
-			fmt.Printf("topic %s is deleted\n", topic)
+			logger.Infof("topic %s is deleted", topic)
 		}
 	}
 }
 
-func doTopicInfoQuery(client *hedera.Client, topicIdStr string) {
-	topicId, err := hedera.TopicIDFromString(topicIdStr)
+func doTopicInfoQuery(client *hedera.Client) {
+	topicId, err := hedera.TopicIDFromString(*queryTopicId)
 	if err != nil {
-		fmt.Printf("invalid topic id %s, err = %v\n", topicIdStr, err)
-		return
+		logger.Fatalf("invalid topic id %s, err = %v", *queryTopicId, err)
+	}
+	info, err := hedera.NewConsensusTopicInfoQuery().
+		SetTopicID(topicId).
+		Execute(client)
+	if err != nil {
+		logger.Fatalf("failed to query topic (%s) info = %v", *queryTopicId, err)
 	}
 
-	query := hedera.NewConsensusTopicInfoQuery()
-	q := query.SetTopicID(topicId)
-
-	info, err := q.Execute(client)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("Info of topic %s:\n", topicIdStr)
-	fmt.Printf("\tMemo: %s\n", info.Memo)
-	fmt.Printf("\tSequencenumber: %d\n", info.SequenceNumber)
-	fmt.Printf("\tExpirationTime: %v\n", info.ExpirationTime)
-	fmt.Printf("\tAutoRenewPeriod: %v\n", info.AutoRenewPeriod)
-	fmt.Printf("\tAutoRenewAccountID: %v\n", info.AutoRenewAccountID)
+	logger.Infof("Info of topic %s:", *queryTopicId)
+	logger.Infof("\tMemo: %s", info.Memo)
+	logger.Infof("\tSequencenumber: %d", info.SequenceNumber)
+	logger.Infof("\tExpirationTime: %v", info.ExpirationTime)
+	logger.Infof("\tAutoRenewPeriod: %v", info.AutoRenewPeriod)
+	logger.Infof("\tAutoRenewAccountID: %v", info.AutoRenewAccountID)
 }
 
 type subResp struct {
@@ -244,17 +297,15 @@ type subResp struct {
 	info *hedera.ConsensusTopicInfo
 }
 
-func doTopicSubscribe(client *hedera.Client, topicIdStr string) {
-	topicId, err := hedera.TopicIDFromString(topicIdStr)
+func doTopicSubscribe(client *hedera.Client) {
+	topicId, err := hedera.TopicIDFromString(*subscribeTopicId)
 	if err != nil {
-		fmt.Printf("invalid topic id %s, err = %v\n", topicIdStr, err)
-		return
+		logger.Fatalf("invalid topic id %s, err = %v", *subscribeTopicId, err)
 	}
 
 	mirrorClient, err := hedera.NewMirrorClient(mirrorNodeAddress)
 	if err != nil {
-		fmt.Printf("err creating mirror client = %v\n", err)
-		return
+		logger.Fatalf("failed to create mirror client = %v", err)
 	}
 
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -280,15 +331,15 @@ func doTopicSubscribe(client *hedera.Client, topicIdStr string) {
 				}
 			},
 			func(err error) {
-				fmt.Println(err.Error())
+				logger.Infof("mirror subscription error = %v", err)
 			})
 	if err != nil {
-		panic(err)
+		logger.Fatalf("failed to create mirror consensus topic query = %v", err)
 	}
 
 	defer func() {
 		handle.Unsubscribe()
-		fmt.Println("unsubscribed from topic, sleep 1 second")
+		logger.Info("unsubscribed from topic, sleep 1 second")
 		time.Sleep(time.Second)
 	}()
 
@@ -297,11 +348,11 @@ func doTopicSubscribe(client *hedera.Client, topicIdStr string) {
 		select {
 		case res := <-respCh:
 			if res.resp != nil {
-				fmt.Printf("received message of %d bytes payload, with sequence: %d\n", len(res.resp.Message), res.resp.SequenceNumber)
+				logger.Infof("received message of %d bytes payload, with sequence: %d", len(res.resp.Message), res.resp.SequenceNumber)
 				count++
 			} else {
 				if lastSequenceNumber != res.info.SequenceNumber {
-					fmt.Printf("topic info: last sequence number %d\n", res.info.SequenceNumber)
+					logger.Infoln("topic info: last sequence number", res.info.SequenceNumber)
 					lastSequenceNumber = res.info.SequenceNumber
 				}
 			}
@@ -327,28 +378,33 @@ func doTopicSubscribe(client *hedera.Client, topicIdStr string) {
 	}
 }
 
-type ConsensusResponseMetadata struct {
-	Message   []byte
-	Timestamp time.Time
+type consensusResponseMetadata struct {
+	message   []byte
+	timestamp time.Time
 }
 
-func doTopicBenchmark(client *hedera.Client, topicIdStr string) {
-	topicId, err := hedera.TopicIDFromString(topicIdStr)
+type benchmarkMessage struct {
+	Magic     []byte
+	Timestamp time.Time
+	Payload   string
+}
+
+func doTopicBenchmark(client *hedera.Client) {
+	topicId, err := hedera.TopicIDFromString(*benchmarkTopicId)
 	if err != nil {
-		fmt.Printf("invalid topic id %s, err = %v\n", topicIdStr, err)
-		return
+		logger.Fatalf("invalid topic id %s, err = %v", *benchmarkTopicId, err)
 	}
 
 	mirrorClient, err := hedera.NewMirrorClient(mirrorNodeAddress)
 	if err != nil {
-		panic(err)
+		logger.Fatalf("failed to create mirror client = %v", err)
 	}
 
 	magic := make([]byte, 4)
 	rand.Seed(time.Now().UnixNano())
 	rand.Read(magic)
 
-	ch := make(chan *ConsensusResponseMetadata)
+	ch := make(chan *consensusResponseMetadata)
 	done := make(chan struct{})
 	handle, err := hedera.NewMirrorConsensusTopicQuery().
 		SetTopicID(topicId).
@@ -360,66 +416,67 @@ func doTopicBenchmark(client *hedera.Client, topicIdStr string) {
 				case <-done:
 					// do nothing
 				default:
-					metadata := ConsensusResponseMetadata{
-						Message:   resp.Message,
-						Timestamp: time.Now(),
+					metadata := consensusResponseMetadata{
+						message:   resp.Message,
+						timestamp: time.Now(),
 					}
 					ch <- &metadata
 				}
 			},
 			func(err error) {
-				fmt.Println(err.Error())
+				logger.Infof("mirror subscription error = %v", err)
 			})
 	if err != nil {
-		panic(err)
+		logger.Fatalf("failed to create mirror consensus topic query = %v", err)
 	}
 
 	defer func() {
 		handle.Unsubscribe()
-		fmt.Println("unsubscribed from topic, sleep 1 second")
+		logger.Print("unsubscribed from topic, sleep 1 second")
 		time.Sleep(time.Second)
 	}()
 
-	stats := make(map[string]time.Time)
 	ticker := time.NewTicker(500 * time.Millisecond) // a 500ms interval ticker
 	produced := 0
 	verified := 0
+	rtts := make([]time.Duration, 0, 20)
+	totalRtt := time.Duration(0)
 
 	for {
 		select {
 		case metadata := <-ch:
-			data := metadata.Message
-			if bytes.Compare(data[0:len(magic)], magic) == 0 {
-				msg := string(data[len(magic):])
-				start, ok := stats[msg]
-				if !ok {
-					fmt.Printf("cannot find message '%s' in stats map\n", msg)
-				} else {
-					fmt.Printf("roundtrip delay for message '%s' is %v\n", msg, metadata.Timestamp.Sub(start))
-					delete(stats, msg)
-					verified++
-				}
-			} else {
-				fmt.Printf("recieved a messsage not sent by us, skip it...\n")
+			message := &benchmarkMessage{}
+			if json.Unmarshal(metadata.message, message) != nil {
+				logger.Info("failed to unmarshal the message, skip it...")
+				continue
 			}
-		case start := <-ticker.C:
-			msg := fmt.Sprintf("hello %d", produced)
-			data := append(magic, []byte(msg)...)
-			stats[msg] = start
-			id, err := hedera.NewConsensusMessageSubmitTransaction().
+			if bytes.Compare(message.Magic, magic) == 0 {
+				rtt := metadata.timestamp.Sub(message.Timestamp)
+				logger.Infof("roundtrip delay for message '%s' is %v", message.Payload, rtt)
+				rtts = append(rtts, rtt)
+				totalRtt += rtt
+				verified++
+			} else {
+				logger.Info("received a message not sent by us, skip it...")
+			}
+		case now := <-ticker.C:
+			message := &benchmarkMessage{
+				Magic:     magic,
+				Timestamp: now,
+				Payload:   fmt.Sprintf("hello %d", produced),
+			}
+			data, err := json.Marshal(message)
+			if err != nil {
+				logger.Fatalf("failed to marshal benchmarkMessage to JSON = %v", err)
+			}
+			_, err = hedera.NewConsensusMessageSubmitTransaction().
 				SetTopicID(topicId).
 				SetMessage(data).
 				Execute(client)
 			if err != nil {
-				panic(err)
+				logger.Fatalf("failed to submit consensus message = %v", err)
 			}
-
-			_, err = id.GetReceipt(client)
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Printf("message '%s' sent\n", msg)
+			logger.Infof("message '%s' sent", message.Payload)
 			produced++
 			if produced == 20 {
 				ticker.Stop()
@@ -427,34 +484,28 @@ func doTopicBenchmark(client *hedera.Client, topicIdStr string) {
 		}
 
 		if verified == 20 {
-			fmt.Printf("received all 20 benchmark messages\n")
+			logger.Info("received all 20 benchmark messages")
 			close(done)
 			break
 		}
 	}
+	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+	logger.Infof("stats: average - %v, min - %v, max - %v, median - %v", totalRtt/20, rtts[0], rtts[19], rtts[10])
 }
 
 func doTopicCommand(cmd string) {
 	client := createClient()
-
 	switch cmd {
 	case "create":
-		topics := doTopicCreate(client, *createTopicCount)
-		for _, topic := range topics {
-			if topic != nil {
-				fmt.Printf("new topic id: %s\n", *topic)
-			}
-		}
+		doTopicCreate(client)
 	case "delete":
-		doTopicDelete(client, deleteTopicIds)
+		doTopicDelete(client)
 	case "query":
-		doTopicInfoQuery(client, *queryTopicId)
+		doTopicInfoQuery(client)
 	case "subscribe":
-		doTopicSubscribe(client, *subscribeTopicId)
+		doTopicSubscribe(client)
 	case "benchmark":
-		doTopicBenchmark(client, *benchmarkTopicId)
-	default:
-		fmt.Println("unknown command", cmd)
+		doTopicBenchmark(client)
 	}
 }
 
@@ -465,28 +516,31 @@ func doKeyCommand(cmd string) {
 		if privKey, err := hedera.GenerateEd25519PrivateKey(); err != nil {
 			panic(err)
 		} else {
-			fmt.Printf("generated ed25519 private key, please save it in a secure store:\n%s\n", privKey.String())
-			fmt.Printf("public key:\n%s\n", privKey.PublicKey().String())
+			logger.Infoln("generated ed25519 private key, please save it in a secure store:", privKey)
+			logger.Infoln("ed25519 public key:", privKey.PublicKey())
 		}
 	case "pub":
 		// get public key
 		if privKey, err := hedera.Ed25519PrivateKeyFromString(*getPubKeyPrivateKey); err != nil {
-			panic(err)
+			logger.Fatalf("invalid private key - %v", err)
 		} else {
-			fmt.Printf("ed25519 public key:\n%s\n", privKey.PublicKey().String())
+			logger.Infoln("ed25519 public key:", privKey.PublicKey())
 		}
-	default:
-		fmt.Println("unknown command", cmd)
 	}
 }
 
+func createLogger() {
+	logger = log.New()
+	logger.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+}
+
 func main() {
+	createLogger()
 	// parse the command line
 	cmds := strings.Split(kingpin.Parse(), " ")
 
 	if err := loadConfig(); err != nil {
-		fmt.Fprintf(os.Stderr, "error loading config = %v\n", err)
-		os.Exit(1)
+		logger.Fatalf("error loading config = %v", err)
 	}
 
 	switch cmd := cmds[0]; cmd {
@@ -496,7 +550,5 @@ func main() {
 		doTopicCommand(cmds[1])
 	case "key":
 		doKeyCommand(cmds[1])
-	default:
-		fmt.Printf("unknown command %s\n", cmd)
 	}
 }
