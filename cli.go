@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"github.com/hashgraph/hedera-sdk-go"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"io/ioutil"
 	"math/rand"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -18,7 +17,7 @@ import (
 var (
 	logger *log.Logger
 
-	configFile = kingpin.Flag("config", "json configuration file").Default("./hedera_env.json").String()
+	configFile = kingpin.Flag("config", "json configuration file").Default("hedera_env.json").String()
 
 	// account commands
 	account           = kingpin.Command("account", "account operations")
@@ -53,8 +52,7 @@ var (
 	getPubKeyPrivateKey = getPubKey.Arg("privkey", "the ed25519 private key string").Required().String()
 
 	// global configs
-	nodeId             hedera.AccountID
-	nodeAddress        string
+	network            map[string]hedera.AccountID
 	operatorId         hedera.AccountID
 	operatorPrivateKey hedera.Ed25519PrivateKey
 	mirrorNodeAddress  string
@@ -65,76 +63,70 @@ var (
 type HederaConfig struct {
 	OperatorId        string
 	OperatorKey       string
-	NodeId            string
-	NodeAddress       string
+	NodeId            string // deprecated, replaced by Network
+	NodeAddress       string // deprecated, replaced by Network
 	MirrorNodeAddress string
 }
 
-func loadConfigFromFile(filename string) (*HederaConfig, error) {
-	file, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	config := HederaConfig{}
-	err = json.Unmarshal([]byte(file), &config)
-	if err != nil {
-		return nil, err
-	}
-	return &config, nil
-}
+func loadConfig(configFile string) error {
+	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
+	v.AutomaticEnv()
+	v.SetConfigName(configFile)
+	v.SetConfigType("json")
+	v.AddConfigPath(".")
 
-func loadConfigFromEnv() (*HederaConfig, error) {
-	config := HederaConfig{}
-	var allValues = []struct {
-		value *string
-		name  string
-	}{
-		{&config.OperatorId, "OPERATOR_ID"},
-		{&config.OperatorKey, "OPERATOR_KEY"},
-		{&config.NodeId, "NODE_ID"},
-		{&config.NodeAddress, "NODE_ADDRESS"},
-		{&config.MirrorNodeAddress, "MIRROR_NODE_ADDRESS"},
+	var err error
+	if err = v.ReadInConfig(); err != nil {
+		logger.Fatalf("failed to read configuration = %v", err)
+	}
+	var config HederaConfig
+	if err := v.Unmarshal(&config); err != nil {
+		logger.Fatalf("failed to unmarshal configuration = %v", err)
 	}
 
-	for _, entry := range allValues {
-		*entry.value = os.Getenv(entry.name)
-		if *entry.value == "" {
-			return nil, fmt.Errorf("env variable %s is not set", entry.name)
-		}
-	}
-
-	return &config, nil
-}
-
-func loadConfig() error {
-	configSource := fmt.Sprintf("file - %s", *configFile)
-	config, err := loadConfigFromFile(*configFile)
-	if err != nil {
-		configSource = "environment variables"
-		if config, err = loadConfigFromEnv(); err != nil {
-			return err
-		}
-	}
-
-	// parse the config
-	if nodeId, err = hedera.AccountIDFromString(config.NodeId); err != nil {
-		return fmt.Errorf("invalid node id string from %s = %v", configSource, err)
-	}
 	if operatorId, err = hedera.AccountIDFromString(config.OperatorId); err != nil {
-		return fmt.Errorf("invalid operator id string from %s = %v", configSource, err)
+		return fmt.Errorf("invalid node id = %v", err)
 	}
 	if operatorPrivateKey, err = hedera.Ed25519PrivateKeyFromString(config.OperatorKey); err != nil {
-		return fmt.Errorf("invalid operator private key string from %s = %v", configSource, err)
+		return fmt.Errorf("invalid operator private key = %v", err)
 	}
-	nodeAddress = config.NodeAddress
 	mirrorNodeAddress = config.MirrorNodeAddress
-	logger.Printf("loaded configuration from %s", configSource)
+
+	network = make(map[string]hedera.AccountID)
+	if config.NodeAddress != "" && config.NodeId != "" {
+		nodeId, err := hedera.AccountIDFromString(config.NodeId)
+		if err != nil {
+			return fmt.Errorf("invalid node id =  %v", err)
+		}
+		network[config.NodeAddress] = nodeId
+	} else {
+		// workaround for the viper issue that json string map in env var will not be converted to map[string]string
+		networkVal := v.Get("network")
+		var networkMap map[string]string
+		switch val := networkVal.(type) {
+		case string:
+			networkMap = v.GetStringMapString("network")
+		case map[string]interface{}:
+			networkMap = v.GetStringMapString("network")
+		default:
+			return fmt.Errorf("invalid type of network - %T", val)
+		}
+		if len(networkMap) == 0 {
+			return fmt.Errorf("empty network")
+		}
+		for address, id := range networkMap {
+			nodeId, err := hedera.AccountIDFromString(id)
+			if err != nil {
+				return fmt.Errorf("invalid node id = %v", err)
+			}
+			network[address] = nodeId
+		}
+	}
 	return nil
 }
 
 func createClient() *hedera.Client {
-	nodes := map[string]hedera.AccountID{nodeAddress: nodeId}
-	client := hedera.NewClient(nodes)
+	client := hedera.NewClient(network)
 	client.SetOperator(operatorId, operatorPrivateKey)
 	return client
 }
@@ -192,7 +184,7 @@ func makePublicKey(threshold uint32, keys []string, operatorPublicKey hedera.Ed2
 
 	thresholdKey := hedera.NewThresholdKey(threshold)
 	var lastKey hedera.PublicKey
-	for str, _ := range keySet {
+	for str := range keySet {
 		publicKey, err := hedera.Ed25519PublicKeyFromString(str)
 		if err != nil {
 			return nil, err
@@ -539,7 +531,7 @@ func main() {
 	// parse the command line
 	cmds := strings.Split(kingpin.Parse(), " ")
 
-	if err := loadConfig(); err != nil {
+	if err := loadConfig(*configFile); err != nil {
 		logger.Fatalf("error loading config = %v", err)
 	}
 
