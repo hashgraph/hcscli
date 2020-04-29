@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "v0.1.0"
+	version = "v0.2.0"
 	logger  *log.Logger
 
 	configFile = kingpin.Flag("config", "json configuration file").Default("hedera_env.json").String()
