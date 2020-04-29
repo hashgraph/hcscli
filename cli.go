@@ -9,13 +9,15 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"math/rand"
+	"os"
 	"sort"
 	"strings"
 	"time"
 )
 
 var (
-	logger *log.Logger
+	version = "v0.1.0"
+	logger  *log.Logger
 
 	configFile = kingpin.Flag("config", "json configuration file").Default("hedera_env.json").String()
 
@@ -50,6 +52,8 @@ var (
 	_                   = key.Command("gen", "generate ed25519 private key")
 	getPubKey           = key.Command("pub", "get public key from ed25519 private key")
 	getPubKeyPrivateKey = getPubKey.Arg("privkey", "the ed25519 private key string").Required().String()
+
+	_ = kingpin.Command("version", "show version information")
 
 	// global configs
 	network            map[string]hedera.AccountID
@@ -226,13 +230,11 @@ func doTopicCreate(client *hedera.Client) {
 		}
 		txId, err := tx.Execute(client)
 		if err != nil {
-			logger.Printf("failed to create a new topic, %v", err)
-			continue
+			logger.Fatalf("failed to create a new topic, %v", err)
 		}
 		receipt, err := txId.GetReceipt(client)
 		if err != nil {
-			logger.Infof("failed to get receipt of topic create transaction, %v", err)
-			continue
+			logger.Fatalf("failed to get receipt of topic create transaction, %v", err)
 		}
 		logger.Infoln("new topic id:", receipt.GetConsensusTopicID())
 	}
@@ -242,7 +244,7 @@ func doTopicDelete(client *hedera.Client) {
 	for _, topic := range *deleteTopicIds {
 		topicId, err := hedera.TopicIDFromString(topic)
 		if err != nil {
-			logger.Infof("invalid topic id %s, err = %v", topic, err)
+			logger.Errorf("invalid topic id %s, err = %v", topic, err)
 			continue
 		}
 
@@ -251,7 +253,7 @@ func doTopicDelete(client *hedera.Client) {
 			SetTopicID(topicId).
 			Execute(client)
 		if err != nil {
-			logger.Infof("failed to delete topic %s = %v", topic, err)
+			logger.Errorf("failed to delete topic %s = %v", topic, err)
 			continue
 		}
 
@@ -416,7 +418,7 @@ func doTopicBenchmark(client *hedera.Client) {
 				}
 			},
 			func(err error) {
-				logger.Infof("mirror subscription error = %v", err)
+				logger.Errorf("mirror subscription error = %v", err)
 			})
 	if err != nil {
 		logger.Fatalf("failed to create mirror consensus topic query = %v", err)
@@ -449,7 +451,7 @@ func doTopicBenchmark(client *hedera.Client) {
 				totalRtt += rtt
 				verified++
 			} else {
-				logger.Info("received a message not sent by us, skip it...")
+				logger.Infoln("received a message not sent by us, skip it...")
 			}
 		case now := <-ticker.C:
 			message := &benchmarkMessage{
@@ -476,7 +478,7 @@ func doTopicBenchmark(client *hedera.Client) {
 		}
 
 		if verified == 20 {
-			logger.Info("received all 20 benchmark messages")
+			logger.Infoln("received all 20 benchmark messages")
 			close(done)
 			break
 		}
@@ -524,12 +526,17 @@ func doKeyCommand(cmd string) {
 func createLogger() {
 	logger = log.New()
 	logger.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+	logger.SetOutput(os.Stdout)
 }
 
 func main() {
 	createLogger()
 	// parse the command line
 	cmds := strings.Split(kingpin.Parse(), " ")
+	if cmds[0] == "version" {
+		logger.Infoln("version:", version)
+		return
+	}
 
 	if err := loadConfig(*configFile); err != nil {
 		logger.Fatalf("error loading config = %v", err)
