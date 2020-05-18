@@ -78,6 +78,7 @@ func loadConfig(configFile string) error {
 	v.SetConfigName(configFile)
 	v.SetConfigType("json")
 	v.AddConfigPath(".")
+	v.AddConfigPath("/")
 
 	var err error
 	if err = v.ReadInConfig(); err != nil {
