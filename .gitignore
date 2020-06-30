@@ -17,3 +17,6 @@ vendor/
 # Editors
 .idea
 .env
+
+# binary
+hcscli
