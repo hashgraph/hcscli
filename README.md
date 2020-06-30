@@ -27,7 +27,7 @@ $ hcscli account balance 0.0.100
 Example output:
 
 ``` shell
-balance for account 0.0.100 = 10000 ℏ
+account: 0.0.100, balance: 10000 ℏ
 ```
 
 ## License Information
