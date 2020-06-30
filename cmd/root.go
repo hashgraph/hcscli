@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	Version = "v0.2.1"
+	Version = "v0.3.0"
 
 	configFile string
 	logLevel string
