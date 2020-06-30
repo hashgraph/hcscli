@@ -1,8 +1,6 @@
 {
     "operatorId": "Put your hedera mainnet/testnet account here",
     "operatorKey": "Put your account private key here",
-    "nodeId": "",
-    "nodeAddress": "",
     "network": {
         "0.testnet.hedera.com:50211": "0.0.3",
         "1.testnet.hedera.com:50211": "0.0.4",
