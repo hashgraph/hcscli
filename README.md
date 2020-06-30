@@ -9,7 +9,7 @@ register at [portal.hedera.com](https://portal.hedera.com) to get an *account*. 
 ## Installation
 
 ``` shell
-$ git clone https://github.com/hashgraph/hcscli
+$ GO111MODULE=on go get github.com/hashgraph/hcscli
 ```
 
 ## Configure your Hedera environment 
@@ -22,9 +22,7 @@ $ git clone https://github.com/hashgraph/hcscli
 ## Get your account balance
 
 ``` shell
-$ cd hcscli
-$ go build
-$ ./hcscli account balance 0.0.100
+$ hcscli account balance 0.0.100
 ```
 Example output:
 
